@@ -33,6 +33,7 @@
 #include <cmath>
 #include <chrono>
 #include <unordered_map>
+#include <stdexcept>
 
 #include "Polygon.h"
 
@@ -120,6 +121,23 @@ int Polygon::updateCenter() {
     center_[2] = sum_lz/sum_l + tmp_origin[2];
 
     return 0;
+}
+
+void Polygon::centerWeightForceOnEdge(const Edge* edge, double perimeter, const double* force,
+                                      double (&contribution)[3]) const {
+    // Perimeter-weighted face center Jacobian from Tao Zhang's Rust TVM
+    // (src/mechanics.rs at 1676eb89e3ca969fdfece7b0ee89dbd6d093a740, GPL-3.0-or-later).
+    if (!(isfinite(perimeter) && perimeter > 0. &&
+          isfinite(edge->length_) && edge->length_ > 0.)) {
+        throw std::runtime_error("Degenerate face center geometry at polygon " + std::to_string(id_));
+    }
+    double offset[3];
+    for (int m = 0; m < 3; ++m) offset[m] = edge->center_[m] - center_[m];
+    run_->box_->resetDistance(offset);
+    double derivative = 0.;
+    for (int m = 0; m < 3; ++m) derivative += force[m] * offset[m];
+    derivative /= perimeter * edge->length_;
+    for (int m = 0; m < 3; ++m) contribution[m] = derivative * edge->vv_[m];
 }
 
 int Polygon::updateArea() {

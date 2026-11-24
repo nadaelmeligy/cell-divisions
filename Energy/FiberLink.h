@@ -41,6 +41,16 @@ public:
     long int nFormedLinks_;
     double shrinkSpeed_;
     double shrinkStartTime_;
+    // CHANGED 2026-11: time at which the engine creates the linkers. It was the number 500 typed
+    // into Run.cpp; now it is the optional 7th number of the 'link' line in conf (default 500).
+    double linkStartTime_;
+    // CHANGED 2026-11-24: conf 'link_rest attach' -> true = passive linkers. Each linker's rest length is its
+    // own length when it attaches (Link::restLength_), so a new linker carries no tension and only resists
+    // being stretched further; the shrink rule (which changes l0_) does not touch these rest lengths.
+    // Default false ('link_rest fixed'): every linker uses l0_ from the 'link' line, as before.
+    bool restAtAttach_ = false;
+    double linkLength(Link *);   // current length |node - face centre| (periodic box)
+    double restLength(Link *);   // rest length used for this linker (passive: set on first use)
 
     explicit FiberLink(Run *);
 

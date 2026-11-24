@@ -35,6 +35,117 @@
 #include <unordered_map>
 
 #include "Reconnection.h"
+#include "../Run/MeshValidation.h"
+#include <set>
+#include <stdexcept>
+
+// CHANGED 2026-11-24 (Tao Zhang's Rust TVM, src at commit 1676eb89): a proposed neighbour swap is made reversible. With
+// 'validate_topology on' the edited cells are checked (closed shells, positive volumes, volume kept) before
+// the old mesh is deleted; a failing swap is undone and counted as rejected. Off (default): no change.
+namespace {
+// Preserve the existing local rewrites, but make the proposed edits reversible
+// until all affected cells pass the checks used for Tao's Rust proposals.
+class ProposedSwap {
+public:
+    ProposedSwap(Run& run, std::vector<Cell*> cells, std::vector<Polygon*> faces)
+        : run_(run), vertices_(run.vertices_.size()), edges_(run.edges_.size()),
+          faces_(run.polygons_.size()), vertexId_(run.count_vertices_),
+          edgeId_(run.count_edges_), faceId_(run.count_polygons_) {
+        if (!run_.validateTopology_) return;
+        for (auto* cell : cells) {
+            oldCells_.emplace_back(cell, cell->polygons_);
+            if (cell->type_ < 0)
+                includesExterior_ = true;
+            else
+                oldVolume_ += MeshValidation::signedVolume(*cell, run_);
+        }
+        for (auto* face : faces) {
+            oldFaces_.emplace_back(face, face->edges_);
+            for (auto* edge : face->edges_) triangleCounts_.emplace(edge, edge->triangle_count_);
+        }
+    }
+
+    ~ProposedSwap() {
+        if (accepted_ || !run_.validateTopology_) return;
+        for (auto& item : oldCells_) item.first->polygons_.swap(item.second);
+        for (auto& item : oldFaces_) item.first->edges_.swap(item.second);
+        for (const auto& item : triangleCounts_) item.first->triangle_count_ = item.second;
+        while (run_.polygons_.size() > faces_) {
+            delete run_.polygons_.back();
+            run_.polygons_.pop_back();
+        }
+        while (run_.edges_.size() > edges_) {
+            delete run_.edges_.back();
+            run_.edges_.pop_back();
+        }
+        while (run_.vertices_.size() > vertices_) {
+            delete run_.vertices_.back();
+            run_.vertices_.pop_back();
+        }
+        run_.count_vertices_ = vertexId_;
+        run_.count_edges_ = edgeId_;
+        run_.count_polygons_ = faceId_;
+    }
+
+    bool accept(const char* transition, long id) {
+        if (run_.validateTopology_) {
+            try {
+                std::set<std::pair<long, long>> pairs;
+                for (size_t i = edges_; i < run_.edges_.size(); ++i) {
+                    const Edge& edge = *run_.edges_[i];
+                    auto endpoints = std::minmax(edge.vertices_[0]->id_, edge.vertices_[1]->id_);
+                    if (!pairs.insert(endpoints).second || !(edge.length_ > 0.) || !std::isfinite(edge.length_))
+                        throw std::runtime_error("duplicate or degenerate proposed edge");
+                }
+
+                double volume = 0.;
+                std::vector<std::pair<Cell*, MeshValidation::CellGeometry>> cells;
+                for (const auto& item : oldCells_) {
+                    if (item.first->type_ < 0) continue;
+                    auto geometry = MeshValidation::proposedCell(*item.first, run_);
+                    volume += geometry.volume;
+                    cells.emplace_back(item.first, std::move(geometry));
+                }
+                if (!includesExterior_ && std::abs(volume - oldVolume_) > 1e-8 * std::max(1., std::abs(oldVolume_)))
+                    throw std::runtime_error("proposed cells do not conserve volume");
+                std::vector<std::pair<Polygon*, std::vector<Vertex*>>> loops;
+                for (const auto& item : oldFaces_)
+                    loops.emplace_back(item.first, MeshValidation::faceLoop(*item.first));
+                for (size_t i = faces_; i < run_.polygons_.size(); ++i) {
+                    auto* face = run_.polygons_[i];
+                    loops.emplace_back(face, MeshValidation::faceLoop(*face));
+                }
+                for (auto& item : loops) {
+                    item.first->vertices_.swap(item.second);
+                    item.first->updateCenter();
+                }
+                for (auto& item : cells) item.first->polygonDirections_.swap(item.second.directions);
+            } catch (const std::runtime_error& error) {
+                ++run_.reconnection_->rejectedProposals_;
+                run_.verboseReconnection_ << "Rejected " << transition << " at " << run_.simulation_time_
+                    << ", ID " << id << ": " << error.what() << '\n';
+                return false;
+            }
+        }
+        accepted_ = true;
+        return true;
+    }
+
+    ProposedSwap(const ProposedSwap&) = delete;
+    ProposedSwap& operator=(const ProposedSwap&) = delete;
+
+private:
+    Run& run_;
+    size_t vertices_, edges_, faces_;
+    long vertexId_, edgeId_, faceId_;
+    bool accepted_ = false;
+    bool includesExterior_ = false;
+    double oldVolume_ = 0.;
+    std::vector<std::pair<Cell*, std::vector<Polygon*>>> oldCells_;
+    std::vector<std::pair<Polygon*, std::vector<Edge*>>> oldFaces_;
+    std::unordered_map<Edge*, int> triangleCounts_;
+};
+}
 
 using namespace std;
 
@@ -112,7 +223,13 @@ int     Reconnection::start() {
     run_->updateGeoinfo();
     run_->updateVertexCells();
     run_->updateEdgeCells();
-    run_->volume_->updatePolygonDirections();
+    if (run_->validateTopology_) {
+        // Accepted proposals already set the affected face loops and cell winding.
+        run_->updatePolygonCells();
+        run_->volume_->updateExteriorDirections();
+    } else {
+        run_->volume_->updatePolygonDirections();
+    }
     run_->updateEmptyCells();
 
     return 0;
@@ -305,6 +422,8 @@ int Reconnection::I_H(Edge * edge) {
         exit(1);
     }
 
+    ProposedSwap proposal(*run_, {c123, c456, c1245, c2356, c1346},
+                          {p14, p25, p36, p12, p23, p13, p45, p56, p46});
     // create vertices 7, 8, 9
     Vertex * v7 = new Vertex(run_, run_->count_vertices_);
     run_->count_vertices_ = run_->count_vertices_ + 1;
@@ -477,6 +596,8 @@ int Reconnection::I_H(Edge * edge) {
     p46->expand(e74);
     p46->expand(e96);
 
+    if (!proposal.accept("I->H", edge->id_)) return 1;
+
     // delete vertices 10 and 11
     run_->deleteVertex(v10);
     run_->deleteVertex(v11);
@@ -503,6 +624,7 @@ int Reconnection::I_H(Edge * edge) {
     }
 
     count_IH_ += 1;
+    ++acceptedProposals_;
 
     return 0;
 }
@@ -677,6 +799,30 @@ int Reconnection::H_I(Polygon * polygon) {
         exit(1);
     }
 
+    const auto topDirection = c123->polygonDirections_.find(polygon->id_);
+    const auto bottomDirection = c456->polygonDirections_.find(polygon->id_);
+    // CHANGED 2026-11-24: these two checks used to run further down, after the mesh had been edited,
+    // and stop the whole simulation (exit). With 'validate_topology on' the swap is now skipped instead
+    // (nothing has been edited yet). Without it the original behaviour is kept: same message, exit.
+    if (topDirection == c123->polygonDirections_.end() ||
+        bottomDirection == c456->polygonDirections_.end() ||
+        topDirection->second == bottomDirection->second) {
+        if (!run_->validateTopology_) {
+            printf("Reconnection Error: c123 %ld and c456 %ld have the same direction on polygon 789\n", c123->id_, c456->id_);
+            exit(1);
+        }
+        return 1;
+    }
+    if (find(c123->polygons_.begin(), c123->polygons_.end(), polygon) == c123->polygons_.end() ||
+        find(c456->polygons_.begin(), c456->polygons_.end(), polygon) == c456->polygons_.end()) {
+        if (!run_->validateTopology_) {
+            printf("polygon 789 %ld not found in cell->polygons\n", polygon->id_);
+            exit(1);
+        }
+        return 1;
+    }
+    ProposedSwap proposal(*run_, {c123, c456, c1245, c2356, c1346},
+                          {p14, p25, p36, p12, p23, p13, p45, p56, p46});
     // create vertices 10, 11
     Vertex * v10 = new Vertex(run_, run_->count_vertices_);
     run_->count_vertices_ = run_->count_vertices_ + 1;
@@ -705,10 +851,6 @@ int Reconnection::H_I(Polygon * polygon) {
     }
 
     // compute positions of vertices 10, 11
-    if (c123->polygonDirections_[polygon->id_] == c456->polygonDirections_[polygon->id_]) {
-        printf("Reconnection Error: c123 %ld and c456 %ld have the same direction on polygon 789\n", c123->id_, c456->id_);
-        exit(1);
-    }
     if (!c123->polygonDirections_[polygon->id_]) {
         // uT points to the top cell c123
         for (int m = 0; m < 3; m++) {
@@ -802,6 +944,13 @@ int Reconnection::H_I(Polygon * polygon) {
     p46->expand(e4);
     p46->expand(e6);
 
+    std::vector<Cell *> tmp_cells = {c123, c456};
+    for (auto cell : tmp_cells) {
+        auto it = find(cell->polygons_.begin(), cell->polygons_.end(), polygon);
+        cell->polygons_.erase(it);
+    }
+    if (!proposal.accept("H->I", polygon->id_)) return 1;
+
     // delete vertices 7, 8, 9
     run_->deleteVertex(v7);
     run_->deleteVertex(v8);
@@ -817,16 +966,6 @@ int Reconnection::H_I(Polygon * polygon) {
     run_->deleteEdge(e85);
     run_->deleteEdge(e96);
     // delete polygon 789
-    std::vector<Cell *> tmp_cells = {c123, c456};
-    for (auto cell : tmp_cells) {
-        auto it = find(cell->polygons_.begin(), cell->polygons_.end(), polygon);
-        if (it != cell->polygons_.end()) {
-            cell->polygons_.erase(it);
-        } else {
-            printf("polygon 789 %ld not found in cell->polygons\n", polygon->id_);
-            exit(1);
-        }
-    }
     /////// check links ////////////////
     if (polygon->link_) {
         polygon->link_ = false;
@@ -853,6 +992,7 @@ int Reconnection::H_I(Polygon * polygon) {
     }
 
     count_HI_ += 1;
+    ++acceptedProposals_;
 
     return 0;
 }

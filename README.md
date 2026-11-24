@@ -14,6 +14,16 @@ Jennifer Schwarz @ Syracuse University, jschwarz@physics.syr.edu
 #### Shabeeb's Fork
 This fork from Shabeeb Ameen includes python scripts for analyzing results etc. Documentation in progress.
 
+#### Growth pipeline and linker fixes (Nov 2026)
+- `python3 run_growth.py --name my_run` grows and divides every cell (pressure-limited growth), keeps
+  the cell-ECM linkers across engine restarts, and writes `runs/my_run/movie.mp4`. No ParaView needed.
+- Every change to the code, why, its default and how it was checked: `CHANGES.md`.
+- Faster runs (Nov 25): a full run (t = 0-80) takes 22 min instead of 103, with the same results bit
+  for bit (division in memory, grid contact search): `CHANGES.md` section 8, checks in `experiments/speed/`.
+- Gel connectivity, gel → organoid feedback and durotaxis (Nov 18-19), with videos: `experiments/ecm_connectivity/README.md`.
+- Which fibers push back on the organoid, by fiber angle (Nov 19): `experiments/fiber_angle/README.md`.
+- Build with `./compile.sh` (now works with CMake 4). The original GitHub engine is kept in `build-original/`.
+
 ## Description
 This code is based on Okuda 2013 paper: https://link.springer.com/article/10.1007/s10237-012-0430-7.
 

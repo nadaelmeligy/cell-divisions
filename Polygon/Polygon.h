@@ -51,6 +51,9 @@ public:
 
     int updateVertices();
     int updateCenter();
+    // CHANGED 2026-11-24 (Tao Zhang's Rust TVM): exact face-centre derivative, see Polygon.cpp
+    void centerWeightForceOnEdge(const Edge* edge, double perimeter, const double* force,
+                                 double (&contribution)[3]) const;
     int updateArea();
     bool crossBoundary();
     bool checkH();

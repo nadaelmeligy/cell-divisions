@@ -1,3 +1,19 @@
 build/
 tests/
 toolbox/__pycache__/
+# local run outputs and build folders (not source)
+runs/
+output/
+tmp/
+test-run/
+video-run/
+video-run-r2/
+build-*/
+__pycache__/
+*.pyc
+.DS_Store
+*.tar.gz
+# experiment data that the scripts regenerate (gels, videos, logs)
+experiments/**/inputs/**/*.topo
+experiments/**/*.mp4
+experiments/**/results/*.log

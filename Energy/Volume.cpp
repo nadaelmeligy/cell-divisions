@@ -132,7 +132,15 @@ int Volume::updatePolygonDirections() {
 //        cout << "flipped" << endl;
     }
 
-    // update polygonDirections of emptySpace_
+    updateExteriorDirections();
+    return 0;
+}
+
+// CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): the medium's face directions, split out of
+// updatePolygonDirections so a validated swap can refresh them alone. Now cleared before refilling (stale
+// entries were for deleted faces, whose IDs are never reused, so this changes no result).
+void Volume::updateExteriorDirections() {
+    run_->emptySpace_->polygonDirections_.clear();
     for (auto polygon: run_->emptySpace_->polygons_) {
         Cell * cell = polygon->cells_[0];
         if (cell->type_ < 0) {
@@ -141,7 +149,6 @@ int Volume::updatePolygonDirections() {
         run_->emptySpace_->polygonDirections_[polygon->id_] = (!cell->polygonDirections_[polygon->id_]);
     }
 
-    return 0;
 }
 
 int Volume::updateVolume() {
@@ -236,15 +243,22 @@ int Volume::updatePolygonForces(Cell *cell, Polygon *polygon) {
         sum_l += polygon->edges_[i]->length_;
     }
     for (int i = 0; i < polygon->edges_.size(); i++) {
-        double weight = polygon->edges_[i]->length_/sum_l;
+        Edge* edge = polygon->edges_[i];
+        double weight = edge->length_ / sum_l;
+        // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): exact face-centre derivative, as in Interface.cpp.
+        double correction[3];
+        if (run_->exactFaceCenterForces_)
+            polygon->centerWeightForceOnEdge(edge, sum_l, polygon->volumeForce_, correction);
         for (int k = 0; k < 2; k++) {
-            Vertex *vertex = polygon->edges_[i]->vertices_[k];
+            Vertex *vertex = edge->vertices_[k];
             //**EMPTY CELL CHECK**//
             if (cell->type_ == 0 && vertex->type_ >= 3) {
                 continue;
             }
             for (int m = 0; m < 3; m++) {
-                vertex->volumeForce_[m] = vertex->volumeForce_[m] + 0.5*weight*polygon->volumeForce_[m];
+                vertex->volumeForce_[m] += 0.5 * weight * polygon->volumeForce_[m];
+                if (run_->exactFaceCenterForces_)
+                    vertex->volumeForce_[m] += k == 0 ? -correction[m] : correction[m];
             }
         }
     }

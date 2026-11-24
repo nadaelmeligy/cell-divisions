@@ -43,6 +43,7 @@ FiberElasticity::FiberElasticity(Run * run) {
     ks_ = 0.;
     l0_ = 0.;
     kb_ = 0.;
+    bendForm_ = 0;   // CHANGED 2026-11: original bending energy unless the conf asks for 1
 }
 
 int     FiberElasticity::updateForces() {
@@ -114,7 +115,9 @@ int FiberElasticity::updateBendForces(Node * nj, Node * ni, Node * nk) {
     double dP = dxD[0] * dxU[0] + dxD[1] * dxU[1] + dxD[2] * dxU[2];
     double cosT = dP / (lD * lU);
 
-    double FbendC = -1. * kb_ * (cosT + (double)1.);
+    // CHANGED 2026-11: FbendC is -dE/d(cos theta). For bendForm_ 1, E = kb (1 + cos theta), so it is -kb.
+    // Old: double FbendC = -1. * kb_ * (cosT + (double)1.);
+    double FbendC = (bendForm_ == 1) ? -1. * kb_ : -1. * kb_ * (cosT + (double)1.);
 
     double fbUX = (cosT * dxU[0] / lU - dxD[0] / lD) * FbendC / lU;
     double fbUY = (cosT * dxU[1] / lU - dxD[1] / lD) * FbendC / lU;
@@ -173,7 +176,9 @@ int FiberElasticity::updateEnergy() {
             double lU = sqrt(dxU[0] * dxU[0] + dxU[1] * dxU[1] + dxU[2] * dxU[2]);
             double dP = dxD[0] * dxU[0] + dxD[1] * dxU[1] + dxD[2] * dxU[2];
             double cosT = dP / (lD * lU);
-            bendEnergy_ += 0.5 * kb_ * pow(cosT + 1.0, 2.0);
+            // CHANGED 2026-11: bendForm_ 1 is the worm-like-chain energy (see FiberElasticity.h).
+            // Old: bendEnergy_ += 0.5 * kb_ * pow(cosT + 1.0, 2.0);
+            bendEnergy_ += (bendForm_ == 1) ? kb_ * (cosT + 1.0) : 0.5 * kb_ * pow(cosT + 1.0, 2.0);
         }
     }
 

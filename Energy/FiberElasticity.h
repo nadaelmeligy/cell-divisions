@@ -33,6 +33,11 @@ public:
     double ks_;
     double l0_;
     double kb_;
+    // CHANGED 2026-11: which bending energy (optional 4th number on the conf "fiber" line).
+    // 0 (default, the original): 0.5 kb (1 + cos theta)^2, which grows like (bend angle)^4, so a
+    //   straight fiber has no stiffness against small bends and the gel has zero stiffness at small strain.
+    // 1: kb (1 + cos theta), the usual worm-like-chain form, which grows like 0.5 kb (bend angle)^2.
+    int bendForm_;
     double stretchEnergy_;
     double bendEnergy_;
 

@@ -27,6 +27,8 @@
 
 class Run;
 #include <vector>
+#include <sstream>
+#include "Random.h"
 #include "../Vertex/Vertex.h"
 #include "../Edge/Edge.h"
 #include "../Polygon/Polygon.h"
@@ -39,6 +41,7 @@ class Run;
 #include "../ECM/Link.h"
 #include "../Energy/FiberElasticity.h"
 #include "../Energy/FiberLink.h"
+#include "../Energy/CellFiberContact.h"  // CHANGED 2026-11: new cell-fiber contact force
 //#include "../Contact/Contact.h"
 #include "Box.h"
 
@@ -63,15 +66,16 @@ class Run {
     long int count_log_;
     double   log_period_;
     long int count_reconnect_;
-    long int count_vertices_;
-    long int count_edges_;
-    long int count_polygons_;
-    long int count_cells_;
+    long int count_vertices_ = 0;
+    long int count_edges_ = 0;
+    long int count_polygons_ = 0;
+    long int count_cells_ = 0;
     Cell * emptySpace_;
     Volume * volume_;
     Interface * interface_;
     FiberElasticity * fiberElasticity_;
     FiberLink * fiberLink_;
+    CellFiberContact * cellFiberContact_;  // CHANGED 2026-11: new cell-fiber contact force
 //    Contact * contact_;
     Reconnection * reconnection_;
     Box * box_;
@@ -86,6 +90,22 @@ class Run {
     std::vector<Link *> links_;
     std::vector<Polygon *> boundaryPolygons_;
     std::vector<Edge *> boundaryEdges_;
+    // CHANGED 2026-11: restarting with the previous run's linkers (see Run::loadLinks)
+    bool linksLoaded_;                     // true if loadLinks() read at least one linker from links.input
+    std::vector<Node *> pendingFreeNodes_; // engine rules: ECM nodes loadLinks() could not put back on
+                                           // their saved face; checkLinks() re-attaches them
+    // CHANGED 2026-11: conf line 'linkrules python'. The engine then never creates or re-attaches
+    // linkers itself: it starts from the linkers in links.input (several per cell allowed, one per
+    // face) and removes one only when its face is deleted. Python (linkers.py) forms and breaks
+    // them between runs. Default false = the original engine rules.
+    bool linkRulesPython_;
+    // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, src at commit 1676eb89):
+    bool exactFaceCenterForces_;      // conf 'face_center_forces exact': exact face-centre derivative (off = original)
+    bool validateTopology_ = false;   // conf 'validate_topology on': check the mesh and every proposed swap
+    bool dumpVtk_ = true;             // conf 'dump topo ...': skip the VTK files (topology files only)
+    double reconnectOrigin_ = 0.;     // conf 'reconnect_origin': swap checks at origin + k dtr (restart-proof)
+    Random rng_;                      // one seeded noise stream per run (Random.h), saved in rng.output
+    long int reconnectSweeps_ = 0;    // number of swap checks, written to run_summary.txt
 
     Run();
     int     start();
@@ -99,10 +119,11 @@ class Run {
     int     updateGeoinfo();
     int     updateEmptyCells();
     int     updateVerticesVelocity();
-    int     updateVerticesPosition();
+    int     updateVerticesPosition(double step);
     int     updateNodesVelocity();
-    int     updateNodesPosition();
+    int     updateNodesPosition(double step);
     int     initializeLinks();
+    int     loadLinks(std::string filename);  // CHANGED 2026-11: new, see Run.cpp
     int     checkLinks();
     int     updateLinks();
     int     deleteVertex(Vertex *);
@@ -119,6 +140,7 @@ class Run {
     int     dumpECM();
     int     dumpReconnection();
     int     dumpSpheroidShape();
+    std::string dumpTag() const;
 };
 
 #endif

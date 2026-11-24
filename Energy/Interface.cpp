@@ -171,30 +171,46 @@ int Interface::updatePolygonForces(Polygon *polygon) {
         sum_l += polygon->edges_[i]->length_;
     }
     for (int i = 0; i < polygon->edges_.size(); i++) {
-        double weight = polygon->edges_[i]->length_/sum_l;
+        Edge* edge = polygon->edges_[i];
+        double weight = edge->length_ / sum_l;
+        // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): with 'face_center_forces exact' the force on
+        // the face centre also gets the term from the edge lengths changing when a corner moves (the centre is
+        // the perimeter-weighted mean of edge midpoints). Off (default): the original 0.5*weight split only.
+        double correction[3], emptyCorrection[3];
+        if (run_->exactFaceCenterForces_) {
+            if (polygon->type_ != 0)
+                polygon->centerWeightForceOnEdge(edge, sum_l, polygon->interfaceForce_, correction);
+            if (polygon->type_ == 0 || polygon->type_ == 2)
+                polygon->centerWeightForceOnEdge(edge, sum_l, polygon->interfaceEmptyForce_, emptyCorrection);
+        }
         for (int k = 0; k < 2; k++) {
-            Vertex *vertex = polygon->edges_[i]->vertices_[k];
+            Vertex *vertex = edge->vertices_[k];
+            double sign = k == 0 ? -1. : 1.;
             //**EMPTY CELL CHECK**//
             if (polygon->type_ == 0) {
                 if (vertex->type_ < 3) {
                     for (int m = 0; m < 3; m++) {
                         vertex->interfaceForce_[m] =
                                 vertex->interfaceForce_[m] + 0.5 * weight * polygon->interfaceEmptyForce_[m];
+                        if (run_->exactFaceCenterForces_) vertex->interfaceForce_[m] += sign * emptyCorrection[m];
                     }
                 }
             } else if (polygon->type_ == 2) {
                 for (int m = 0; m < 3; m++) {
-                    vertex->interfaceForce_[m] = vertex->interfaceForce_[m] + 0.5*weight*polygon->interfaceForce_[m];
+                    vertex->interfaceForce_[m] += 0.5 * weight * polygon->interfaceForce_[m];
+                    if (run_->exactFaceCenterForces_) vertex->interfaceForce_[m] += sign * correction[m];
                 }
                 if (vertex->type_ < 3) {
                     for (int m = 0; m < 3; m++) {
                         vertex->interfaceForce_[m] =
                                 vertex->interfaceForce_[m] + 0.5 * weight * polygon->interfaceEmptyForce_[m];
+                        if (run_->exactFaceCenterForces_) vertex->interfaceForce_[m] += sign * emptyCorrection[m];
                     }
                 }
             } else {
                 for (int m = 0; m < 3; m++) {
-                    vertex->interfaceForce_[m] = vertex->interfaceForce_[m] + 0.5*weight*polygon->interfaceForce_[m];
+                    vertex->interfaceForce_[m] += 0.5 * weight * polygon->interfaceForce_[m];
+                    if (run_->exactFaceCenterForces_) vertex->interfaceForce_[m] += sign * correction[m];
                 }
             }
         }

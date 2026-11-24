@@ -33,7 +33,9 @@
 #include <chrono>
 #include <unordered_map>
 #include <random>
+#include <stdexcept>
 #include "Run.h"
+#include "MeshValidation.h"
 
 using namespace std;
 
@@ -48,15 +50,43 @@ Run::Run() {
     kB_ = 1.0;
 //    temperature_ = 1.0e-5;
     NCell_ = 512;
+    // CHANGED 2026-11: start-up values of the new switches (see Run.h): no linkers loaded
+    // from a file yet, and the engine's own linker rules (as in the original code).
+    linksLoaded_ = false;
+    linkRulesPython_ = false;
+    exactFaceCenterForces_ = false;
 }
 
 int Run::start() {
-    count_reconnect_ = 0;
     count_dump_ = 0;
     count_log_ = 0;
     simulation_time_ = t_start_;
     long int simulation_time_counter = 0;
     double t_roundError = 0.01*dt_;
+    // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): exact restarts.
+    // - Swap checks run at reconnect_origin + k dtr (dtr from conf, default 10 dt), so a run cut into pieces
+    //   checks at the same times as one long run. Old: count_reconnect_ = 0, i.e. a check right after the
+    //   first step of every engine start, then every dtr from there.
+    // - rng.input (written as rng.output by the previous run) continues its noise stream and next IDs.
+    const double timeTolerance = min(t_roundError, 32. * numeric_limits<double>::epsilon() *
+                                     max(1., max(abs(t_start_), abs(t_end_))));
+    const double sinceOrigin = t_start_ - reconnectOrigin_;
+    count_reconnect_ = static_cast<long>(floor((sinceOrigin + timeTolerance) / dtr_)) + 1;
+    ifstream rngInput("rng.input");
+    if (rngInput) {
+        if (!rng_.load(rngInput)) throw runtime_error("Invalid rng.input checkpoint");
+        std::string marker;
+        if (rngInput >> marker) {
+            long vertex, edge, face;
+            if (marker != "next_ids" || !(rngInput >> vertex >> edge >> face) ||
+                vertex < 0 || edge < 0 || face < 0)
+                throw runtime_error("Invalid next IDs in rng.input checkpoint");
+            count_vertices_ = max(count_vertices_, vertex);
+            count_edges_ = max(count_edges_, edge);
+            count_polygons_ = max(count_polygons_, face);
+        }
+    }
+    long int stepIndex = 0;
     auto start = chrono::steady_clock::now();
 
     printf("\nSimulation Start ...\n");
@@ -76,17 +106,43 @@ int Run::start() {
     printf("Link_str ");
     printf("Energy      \n");
 
-    while (simulation_time_ < t_end_ + t_roundError) {
+    // CHANGED 2026-11: two start-up warnings for the new settings (they change nothing).
+    // (1) Linkers are created only when a time step lands on the link start time. Warn if no
+    //     step ever will, so a run silently without linkers is not mistaken for a working one.
+    double tLinkStart = fiberLink_->linkStartTime_;
+    double stepsToLink = (tLinkStart - t_start_) / dt_;
+    if (!linkRulesPython_ && !linksLoaded_ && tLinkStart <= t_end_ + t_roundError &&
+        (tLinkStart < t_start_ - t_roundError || fabs(stepsToLink - floor(stepsToLink + 0.5)) > 0.01)) {
+        printf("WARNING: link start time %g is not on a time step of this run (start %g, dt %g): no linkers will be created\n",
+               tLinkStart, t_start_, dt_);
+    }
+    // (2) Contact: a fiber node in contact feels a spring of about k * (fiber segment length);
+    //     explicit time stepping overshoots once mu * k * l0 * dt goes above about 1.
+    if (cellFiberContact_->k_ > 0.) {
+        double stability = mu_ * cellFiberContact_->k_ * fiberElasticity_->l0_ * dt_;
+        printf("contact stability number mu*k*l0*dt = %.3f%s\n", stability,
+               stability > 1. ? "  WARNING: above 1, lower k or dt" : " (fine, below 1)");
+    }
+
+    // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): the last frame is the one at exactly t_end; the loop
+    // stops there. Old: while (simulation_time_ < t_end_ + t_roundError), which took one more step after the
+    // last dump (that step was never saved).
+    while (true) {
+        const bool finalFrame = simulation_time_ >= t_end_;
         // update geometry information
         updateGeoinfo();
         // update volumeForces
         volume_->updateForces();
+        if (validateTopology_) MeshValidation::positiveVolumes(*this);  // CHANGED 2026-11-24: optional mesh check
         // update interfaceForces
         interface_->updateForces();
         // update fiberForces
         fiberElasticity_->updateForces();
         // update linkForces
         fiberLink_->updateForces();
+        // CHANGED 2026-11: new cell-fiber contact force (Energy/CellFiberContact.cpp). Without a
+        // 'contact' line in conf it only sets every contact force to zero.
+        cellFiberContact_->updateForces();
 //        // update contactForces
 //        contact_->updateForces();
 
@@ -94,13 +150,19 @@ int Run::start() {
         updateVerticesVelocity();
         updateNodesVelocity();
 
-        if (simulation_time_ > 500. - t_roundError && simulation_time_ < 500. + t_roundError) {
+        // CHANGED 2026-11: linkers used to be created only when the clock read exactly 500
+        // (typed in here), so a run that started after 500, which is every restart, never had any.
+        // Now the time comes from conf (link line, 7th number, default 500), and nothing is created
+        // if the linkers were loaded from links.input or if Python decides them ('linkrules python').
+        // Old: if (simulation_time_ > 500. - t_roundError && simulation_time_ < 500. + t_roundError) {
+        double tLink = fiberLink_->linkStartTime_;
+        if (!linkRulesPython_ && !linksLoaded_ && simulation_time_ > tLink - t_roundError && simulation_time_ < tLink + t_roundError) {
             initializeLinks();
         }
 
 
         // log to screen
-        if (simulation_time_ - t_start_ + t_roundError  > count_log_ * log_period_) {
+        if (finalFrame || simulation_time_ - t_start_ + timeTolerance >= count_log_ * log_period_) {
             volume_->updateEnergy();
             interface_->updateEnergy();
             fiberElasticity_->updateEnergy();
@@ -123,15 +185,15 @@ int Run::start() {
             count_log_++;
         }
         // dump
-        if (simulation_time_ - t_start_ + t_roundError > count_dump_ * dump_period_) {
-            if (simulation_time_ > (-1.)*t_roundError) {
+        if (finalFrame || simulation_time_ - t_start_ + timeTolerance >= count_dump_ * dump_period_) {
+            if (simulation_time_ >= -timeTolerance || finalFrame) {
                 dumpTopo();
                 dumpECM();
                 dumpCellCenter();
                 dumpCellShapeIndex();
                 dumpCellVolume();
 //                dumpReconnection();
-                dumpConfigurationVtk();
+                if (dumpVtk_) dumpConfigurationVtk();  // CHANGED 2026-11-24: 'dump topo' skips the VTK files
                 dumpLinkInfo();
                 dumpSpheroidShape();
                 // dumpVertexForce();
@@ -141,46 +203,77 @@ int Run::start() {
             count_dump_++;
         }
 
-        // Euler dynamics
-        updateVerticesPosition();
-        updateNodesPosition();
-
-        // reconnect
-        if (simulation_time_ - t_start_ + t_roundError > count_reconnect_ * dtr_) {
-            reconnection_->start();
-            count_reconnect_++;
-
-            if (simulation_time_ > 500. + t_roundError) {
-
-//                cout << "check 1" << endl;
-                checkLinks();
-//                cout << "check 2" << endl;
-//                updateLinks();
-            }
-        }
+        if (finalFrame) break;
 
         // decrease the rest length of link spring from 2.0 to 0.2 in time interval 5000, every 200 time intervals.
         if (simulation_time_ > fiberLink_->shrinkStartTime_ - t_roundError  && fiberLink_->l0_ > fiberLink_->l1_) {
             if ((simulation_time_ - fiberLink_->shrinkStartTime_ + t_roundError ) > simulation_time_counter * 10.){
-                fiberLink_->l0_ = fiberLink_->l0_ - fiberLink_->shrinkSpeed_;
+                // CHANGED 2026-11-19: never below the floor l1 (0.3 > 0.2 used to give 0.1).
+                // Old: fiberLink_->l0_ = fiberLink_->l0_ - fiberLink_->shrinkSpeed_;
+                fiberLink_->l0_ = max(fiberLink_->l1_, fiberLink_->l0_ - fiberLink_->shrinkSpeed_);
                 simulation_time_counter = simulation_time_counter + 1;
             }
         }
 
-        simulation_time_ += dt_;
+        // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): Euler step and swap check. The step ends exactly on
+        // t_end or on the next swap-check time. Old: updateVerticesPosition(); updateNodesPosition(); then the
+        // swap check, then simulation_time_ += dt_ (see the old loop condition above).
+        // The endpoint is a real frame. Reconnect after advancing to its labeled time.
+        const double nominalTime = t_start_ + (stepIndex + 1) * dt_;
+        double nextTime = min(nominalTime, t_end_);
+        if (reconnection_->Lth_ > 0.) {
+            const double reconnectTime = reconnectOrigin_ + count_reconnect_ * dtr_;
+            if (reconnectTime < nextTime - timeTolerance) nextTime = reconnectTime;
+        }
+        if (nextTime >= t_end_ - timeTolerance) nextTime = t_end_;
+        if (nextTime >= nominalTime - timeTolerance) ++stepIndex;
+        double step = nextTime - simulation_time_;
+        if (step <= 0.) throw runtime_error("Time step cannot advance at this precision");
+        if (abs(step - dt_) <= timeTolerance) step = dt_;
+        updateVerticesPosition(step);
+        updateNodesPosition(step);
+        simulation_time_ = nextTime;
+        if (simulation_time_ - reconnectOrigin_ + timeTolerance >= count_reconnect_ * dtr_) {
+            if (reconnection_->Lth_ > 0.) {
+                reconnection_->start();
+                ++reconnectSweeps_;
+                if (linksLoaded_ || simulation_time_ > fiberLink_->linkStartTime_ + t_roundError)
+                    checkLinks();
+            }
+            count_reconnect_ = static_cast<long>(
+                floor((simulation_time_ - reconnectOrigin_ + timeTolerance) / dtr_)) + 1;
+        }
     }
 
 //    for (long int i = 0; i < cells_.size(); i++) {
 //        printf("%f\n", cells_[i]->volume_);
 //    }
 
+    // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): save the noise stream and next IDs for the next run
+    // (rng.output -> rng.input), and a short summary (swap checks, accepted and rejected swaps).
+    ofstream rngOutput("rng.output");
+    if (!rng_.save(rngOutput)) throw runtime_error("Could not write rng.output");
+    rngOutput << "next_ids " << count_vertices_ << ' ' << count_edges_ << ' ' << count_polygons_ << '\n';
+    rngOutput.close();
+    if (!rngOutput) throw runtime_error("Could not close rng.output");
+    ofstream summary("run_summary.txt");
+    summary << setprecision(numeric_limits<double>::max_digits10)
+            << "final_time " << simulation_time_ << '\n'
+            << "reconnection_sweeps " << reconnectSweeps_ << '\n'
+            << "accepted_reconnection_proposals " << reconnection_->acceptedProposals_ << '\n'
+            << "rejected_reconnection_proposals " << reconnection_->rejectedProposals_ << '\n';
+    if (!verboseReconnection_.str().empty()) dumpReconnection();
+    summary.close();
+    if (!summary) throw runtime_error("Could not write run_summary.txt");
     return 0;
 }
 
 int     Run::updateVerticesVelocity() {
     for (auto vertex : vertices_) {
         for (int m = 0; m < 3; m++) {
-            vertex->velocity_[m] = mu_ * (vertex->volumeForce_[m] + vertex->interfaceForce_[m] + vertex->linkForce_[m]);
+            // CHANGED 2026-11: add the contact force (exactly zero when contact is off).
+            // Old: vertex->velocity_[m] = mu_ * (vertex->volumeForce_[m] + vertex->interfaceForce_[m] + vertex->linkForce_[m]);
+            vertex->velocity_[m] = mu_ * (vertex->volumeForce_[m] + vertex->interfaceForce_[m] + vertex->linkForce_[m] + vertex->contactForce_[m]);
         }
     }
     // remove drift velocity
@@ -210,40 +303,32 @@ int     Run::updateVerticesVelocity() {
     return 0;
 }
 
-int     Run::updateVerticesPosition() {
-    std::default_random_engine generator(std::random_device{}());
-    std::normal_distribution<double> ndist(0., 1.);
-    double cR = sqrt(2.0*mu_*kB_*temperature_*dt_);
-    double cRe = sqrt(2.0*mu_*kB_*temperature_*dte_);
+// CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): one seeded noise stream (rng_, Random.h) instead of a
+// generator re-seeded from std::random_device at every step, and the step length is passed in (it is dt
+// except for a shorter last step onto t_end or a swap-check time). Same update otherwise: real-cell vertices
+// move by velocity*step + noise (no noise for pulled vertices); medium vertices by at most 0.1 per step.
+int Run::updateVerticesPosition(double step) {
+    const double mediumStep = dte_ * (step / dt_);
+    const double noise = sqrt(2. * mu_ * kB_ * temperature_ * step);
+    const double mediumNoise = sqrt(2. * mu_ * kB_ * temperature_ * mediumStep);
     for (auto vertex : vertices_) {
-        if (vertex->type_ > 0) {
-            if (vertex->pull_) {
-                for (int m = 0; m < 3; m++) {
-                    vertex->position_[m] = vertex->position_[m] + vertex->velocity_[m] * dt_;
-                }
+        for (int m = 0; m < 3; ++m) {
+            if (vertex->type_ > 0) {
+                vertex->position_[m] = vertex->position_[m] + vertex->velocity_[m] * step +
+                    (noise && !vertex->pull_ ? noise * rng_.normal() : 0.);
             } else {
-                for (int m = 0; m < 3; m++) {
-                    vertex->position_[m] =
-                            vertex->position_[m] + vertex->velocity_[m] * dt_ + cR * ndist(generator);
-                }
-            }
-        } else {
-            for (int m = 0; m < 3; m++) {
-                if (vertex->velocity_[m] * dte_ > 0.1) {
-//                    cout << vertex->velocity_[m] * dte_ << endl;
-                    vertex->velocity_[m] = 0.1/dte_;
-                }
-                if (vertex->velocity_[m] * dte_ < -0.1) {
-//                    cout << vertex->velocity_[m] * dte_ << endl;
-                    vertex->velocity_[m] = -0.1/dte_;
-                }
-                vertex->position_[m] =
-                        vertex->position_[m] + vertex->velocity_[m] * dte_ + cRe * ndist(generator);
+                // CHANGED 2026-11-24: the original arithmetic, so a full step is bit-identical to the original
+                // (cap the velocity, then multiply). The first port capped the displacement at exactly 0.1,
+                // which can differ from (0.1/dte)*dte in the last digit, enough to change chaotic medium motion.
+                double velocity = vertex->velocity_[m];
+                if (velocity * mediumStep > 0.1) velocity = 0.1 / mediumStep;
+                if (velocity * mediumStep < -0.1) velocity = -0.1 / mediumStep;
+                vertex->position_[m] = vertex->position_[m] + velocity * mediumStep +
+                    (mediumNoise ? mediumNoise * rng_.normal() : 0.);
             }
         }
         box_->resetPosition(vertex->position_);
     }
-
     return 0;
 }
 
@@ -257,10 +342,10 @@ int     Run::updateNodesVelocity() {
     return 0;
 }
 
-int     Run::updateNodesPosition() {
+int     Run::updateNodesPosition(double step) {
     for (auto node : nodes_) {
         for (int m = 0; m < 3; m++) {
-            node->position_[m] = node->position_[m] + node->velocity_[m] * dt_;
+            node->position_[m] = node->position_[m] + node->velocity_[m] * step;
         }
         box_->resetPosition(node->position_);
     }
@@ -289,8 +374,7 @@ int     Run::initializeLinks() {
     if (boundaryNodes_.size() < fiberLink_->N_) {
         fiberLink_->N_ = boundaryNodes_.size();
     }
-    std::default_random_engine generator(std::random_device{}());
-    std::shuffle(boundaryNodes_.begin(), boundaryNodes_.end(), generator);
+    std::shuffle(boundaryNodes_.begin(), boundaryNodes_.end(), rng_.engine());  // CHANGED 2026-11-24: same seeded stream
 
     // set pairs of polygon and node
     int countNode = 0;
@@ -355,11 +439,130 @@ int     Run::initializeLinks() {
     return 0;
 }
 
+// CHANGED 2026-11 (new function): rebuild the cell-ECM linkers of a previous run.
+// Why: the engine writes its linkers to NNNNNNN.linkInfo.txt at every dump ("PolygonID NodeID",
+// one line per linker) but never read them back, and it creates linkers only once, at the link
+// start time. So every restart after that time ran with zero linkers. To restart with them, copy
+// the last linkInfo file of the previous run to links.input in the new run folder (run_growth.py
+// does this). If links.input does not exist, nothing is loaded and the run is the original one.
+// Which lines are accepted: the face must exist, be on the organoid surface (type 2) and not be
+// linked already, and each ECM node is used once. With the engine's rules ('linkrules engine',
+// the default) a cell may also hold only one linker; a rejected line's node is re-attached to the
+// best free surface face at the first checkLinks() (same rule as a linker whose face vanished).
+// With 'linkrules python' several linkers per cell are allowed and a rejected line is dropped.
+int     Run::loadLinks(std::string filename) {
+    ifstream in(filename.c_str());
+    if (!in.is_open()) {
+        return 0;
+    }
+    updateGeoinfo();
+    updatePolygonCells();
+    unordered_map<long int, Polygon *> polygonByID;
+    for (auto polygon : polygons_) {
+        polygonByID[polygon->id_] = polygon;
+    }
+    unordered_map<long int, Node *> nodeByID;
+    for (auto node : nodes_) {
+        nodeByID[node->id_] = node;
+    }
+
+    links_.clear();
+    pendingFreeNodes_.clear();
+    long int nRestored = 0;
+    long int nFree = 0;
+    long int nSkipped = 0;
+    std::unordered_map<long int, bool> nodeUsed;
+    string buffer;
+    while (getline(in, buffer)) {
+        istringstream iss(buffer);
+        long int polygonID, nodeID;
+        if (!(iss >> polygonID >> nodeID)) {
+            continue;  // header line ("PolygonID NodeID") or blank line
+        }
+        // CHANGED 2026-11-24: optional 3rd column = a passive linker's saved rest length
+        double savedRest = -1.;
+        if (!(iss >> savedRest) || !(savedRest > 0.)) savedRest = -1.;
+        auto nodeIt = nodeByID.find(nodeID);
+        // CHANGED 2026-11-24 (Matrigel-like mesh): under the Python link rules a node may appear on several
+        // lines; linkers.py enforces how many (link_node_capacity, default 1, so collagen runs are unchanged).
+        // The forces of several linkers on one node add up in FiberLink::updateForces. Old line:
+        //     if (nodeIt == nodeByID.end() || nodeUsed[nodeID]) {
+        if (nodeIt == nodeByID.end() || (nodeUsed[nodeID] && !linkRulesPython_)) {
+            nSkipped++;  // unknown ECM node, or a node that is already on another line
+            continue;
+        }
+        nodeUsed[nodeID] = true;
+        Node * node = nodeIt->second;
+        auto polygonIt = polygonByID.find(polygonID);
+        bool ok = (polygonIt != polygonByID.end()) && polygonIt->second->type_ == 2 && !polygonIt->second->link_;
+        if (ok && !linkRulesPython_) {  // engine rules: one linker per cell
+            for (auto cell : polygonIt->second->cells_) {
+                if (cell->type_ > 0 && cell->link_) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (ok) {
+            Polygon * polygon = polygonIt->second;
+            Link * link = new Link(this, polygon, node);
+            // CHANGED 2026-11-24: passive linkers keep their saved rest length; a new one gets its length now
+            if (fiberLink_->restAtAttach_)
+                link->restLength_ = savedRest > 0. ? savedRest : fiberLink_->linkLength(link);
+            links_.push_back(link);
+            polygon->link_ = true;
+            for (auto cell : polygon->cells_) {
+                if (cell->type_ > 0) {
+                    cell->link_ = true;
+                }
+            }
+            nRestored++;
+        } else if (!linkRulesPython_) {
+            // face missing (e.g. its cell divided in Python), not on the surface, already linked,
+            // or its cell already has a linker: re-attach this node at the first checkLinks()
+            pendingFreeNodes_.push_back(node);
+            nFree++;
+        } else {
+            nSkipped++;
+        }
+    }
+    if (nRestored + nFree > 0) {
+        linksLoaded_ = true;
+    }
+    cout << "Restored " << nRestored << " cell-ECM links from " << filename
+         << " (" << nFree << " ECM nodes will be re-attached at the first link check, "
+         << nSkipped << " lines skipped)" << endl;
+    return 0;
+}
+
 int     Run::checkLinks() {
     updatePolygonCells();
     std::vector<Link *> tmpLinks = links_;
     links_.clear();
     std::vector<Node *> freeNodes;
+    // CHANGED 2026-11: ECM nodes that loadLinks() could not put back on their saved face are
+    // re-attached below, by the same rule the original code uses for a linker whose face vanished.
+    for (auto node : pendingFreeNodes_) {
+        freeNodes.push_back(node);
+    }
+    pendingFreeNodes_.clear();
+
+    // CHANGED 2026-11: with 'linkrules python' Python decides the linkers between runs
+    // (linkers.py). Here a linker is only removed when a neighbour swap deleted its face
+    // (deletePolygon sets id_ = -1); nothing is re-attached. The original rule below would also
+    // remove every linker whose face is badly shaped for a moment (an edge shorter than 0.02 just
+    // before a swap, area < 0.1, ...), which in tests removed 25-45% of the linkers per time
+    // unit, several times Python's own turnover.
+    if (linkRulesPython_) {
+        for (auto link : tmpLinks) {
+            if (link->polygon_->id_ >= 0) {
+                links_.push_back(link);
+            } else {
+                delete link;
+            }
+        }
+        return 0;
+    }
 
     for (auto link : tmpLinks) {
         Polygon * polygon = link->polygon_;
@@ -764,11 +967,26 @@ Edge *  Run::addEdge(Vertex * v0, Vertex * v1) {
     return edge;
 }
 
+// CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): output file names. Whole times give the usual 7-digit
+// name (0000080); other times get their full value, so two dumps within one time unit no longer overwrite
+// each other. Old: setw(7) << floor(simulation_time_ + 0.01 dt).
+string Run::dumpTag() const {
+    ostringstream tag;
+    const double integerTime = round(simulation_time_);
+    if (integerTime >= 0. && abs(simulation_time_ - integerTime) <=
+            min(0.01 * dt_, 32. * numeric_limits<double>::epsilon() * max(1., abs(simulation_time_)))) {
+        tag << setw(7) << setfill('0') << fixed << setprecision(0) << integerTime;
+    } else {
+        tag << setprecision(numeric_limits<double>::max_digits10) << simulation_time_;
+    }
+    return tag.str();
+}
+
 int Run::dumpConfigurationVtk() {
     updatePolygonVertices();
     //////////////////////////////////////////////////////////////////////////////////////
     stringstream filename;
-    filename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".sample.vtk";
+    filename << dumpTag() << ".sample.vtk";
     ofstream out(filename.str().c_str());
     if (!out.is_open()) {
         cout << "Error opening output file " << filename.str().c_str() << endl;
@@ -825,7 +1043,7 @@ int Run::dumpConfigurationVtk() {
     // extra.vtk: not so useful, commenting out this block
     /*
     stringstream filename2;
-    filename2 << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".extra.vtk";
+    filename2 << dumpTag() << ".extra.vtk";
     ofstream out2(filename2.str().c_str());
     if (!out2.is_open()) {
         cout << "Error opening output file " << filename2.str().c_str() << endl;
@@ -891,7 +1109,7 @@ int Run::dumpConfigurationVtk() {
     // dump empty cells vtk: this is not so useful, so we comment out this 
     /*
     stringstream filename1;
-    filename1 << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".empty.vtk";
+    filename1 << dumpTag() << ".empty.vtk";
     ofstream out1(filename1.str().c_str());
     if (!out1.is_open()) {
         cout << "Error opening output file " << filename1.str().c_str() << endl;
@@ -946,7 +1164,7 @@ int Run::dumpConfigurationVtk() {
     */
     //////////////////////////////////////////////////////////////////////////////////////
     stringstream ECMfilename;
-    ECMfilename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".ECM.vtk";
+    ECMfilename << dumpTag() << ".ECM.vtk";
     ofstream ECMout(ECMfilename.str().c_str());
     if (!ECMout.is_open()) {
         cout << "Error opening output file " << ECMfilename.str().c_str() << endl;
@@ -1016,7 +1234,7 @@ int Run::dumpConfigurationVtk() {
 
     //////////////////////////////////////////////////////////////////////////////////////
     stringstream Linkfilename;
-    Linkfilename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".link.vtk";
+    Linkfilename << dumpTag() << ".link.vtk";
     ofstream Linkout(Linkfilename.str().c_str());
     if (!Linkout.is_open()) {
         cout << "Error opening output file " << Linkfilename.str().c_str() << endl;
@@ -1072,19 +1290,25 @@ int Run::dumpConfigurationVtk() {
 
 int     Run::dumpLinkInfo(){
     stringstream Linkfilename;
-    Linkfilename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".linkInfo.txt";
+    Linkfilename << dumpTag() << ".linkInfo.txt";
     ofstream Linkout(Linkfilename.str().c_str());
     if (!Linkout.is_open()) {
         cout << "Error opening output file " << Linkfilename.str().c_str() << endl;
         exit(1);
     }
+    // CHANGED 2026-11-24: with passive linkers ('link_rest attach') a 3rd column saves each linker's rest
+    // length, so the next run keeps it (loadLinks). Otherwise the file is as before.
+    const bool saveRest = fiberLink_->restAtAttach_;
     Linkout << left << setw(12) <<"PolygonID";
-    Linkout << left << setw(12) <<"NodeID"<<endl;
+    Linkout << left << setw(12) <<"NodeID";
+    if (saveRest) Linkout << " RestLength";
+    Linkout << endl;
 
     for (long int i = 0; i < links_.size(); i++) {
         Link * link = links_[i];
         Linkout << left << setw(12) << link->polygon_->id_;
         Linkout << left << setw(12) << link->node_->id_;
+        if (saveRest) Linkout << " " << setprecision(numeric_limits<double>::max_digits10) << fiberLink_->restLength(link);
         Linkout << endl;
     }
     return 0;
@@ -1185,7 +1409,7 @@ int     Run::dumpCellVolume() {
         cout << "Error opening output file " << filename.str().c_str() << endl;
         exit(1);
     }
-    out << "time ";
+    out << setprecision(numeric_limits<double>::max_digits10) << "time ";
     out << left << setw(12) << simulation_time_;
     double totalVolume = 0.;
     int countCells = 0;
@@ -1216,7 +1440,7 @@ int     Run::dumpCellVolume() {
 
 int     Run::dumpVertexForce() {
     stringstream filename;
-    filename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".vertexForce.txt";
+    filename << dumpTag() << ".vertexForce.txt";
     //filename << "vertexForce.txt";
     ofstream out(filename.str().c_str(), std::ios_base::app);
     if (!out.is_open()) {
@@ -1245,15 +1469,18 @@ int     Run::dumpVertexForce() {
 
 int     Run::dumpTopo() {
     stringstream filename;
-    // filename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".topo.txt";
-    filename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".sample.topo";
+    // filename << dumpTag() << ".topo.txt";
+    filename << dumpTag() << ".sample.topo";
     ofstream out(filename.str().c_str(), std::ios_base::app);
     if (!out.is_open()) {
         cout << "Error opening output file " << filename.str().c_str() << endl;
         exit(1);
     }
     out << "time ";
-    out << left << setw(12) << simulation_time_;
+    // CHANGED 2026-11-24 (Tao Zhang's Rust TVM, commit 1676eb89): full precision (17 digits) in the restart files
+    // sample.topo and ECM.topo, so a run continued from them starts from exactly the same positions.
+    // Old: setprecision(5), i.e. 6 digits, which nudged every position at every 1-unit restart.
+    out << setprecision(numeric_limits<double>::max_digits10) << left << setw(12) << simulation_time_;
     out << " box";
     out << " " << left << setw(12) << box_->size_[0];
     out << " " << left << setw(12) << box_->size_[1];
@@ -1265,9 +1492,9 @@ int     Run::dumpTopo() {
     out << endl;
     for (auto vertex : vertices_) {
         out << left << setw(6) << vertex->id_;
-        out << " " << right << setw(12) << scientific << setprecision(5) << vertex->position_[0];
-        out << " " << right << setw(12) << scientific << setprecision(5) << vertex->position_[1];
-        out << " " << right << setw(12) << scientific << setprecision(5) << vertex->position_[2];
+        out << " " << right << setw(12) << scientific << setprecision(numeric_limits<double>::max_digits10) << vertex->position_[0];
+        out << " " << right << setw(12) << scientific << setprecision(numeric_limits<double>::max_digits10) << vertex->position_[1];
+        out << " " << right << setw(12) << scientific << setprecision(numeric_limits<double>::max_digits10) << vertex->position_[2];
         out << endl;
     }
 
@@ -1316,14 +1543,14 @@ int     Run::dumpTopo() {
 
 int     Run::dumpECM()  {
     stringstream filename;
-    filename << setw(7) << setfill('0') << (long int)(floor(simulation_time_+0.01*dt_)) << ".ECM.topo";
+    filename << dumpTag() << ".ECM.topo";
     ofstream out(filename.str().c_str(), std::ios_base::app);
     if (!out.is_open()) {
         cout << "Error opening output file " << filename.str().c_str() << endl;
         exit(1);
     }
     // out << "time ";
-    // out << left << setw(12) << simulation_time_;
+    // out << setprecision(numeric_limits<double>::max_digits10) << left << setw(12) << simulation_time_;
     // out << " box";
     // out << " " << left << setw(12) << box_->size_[0];
     // out << " " << left << setw(12) << box_->size_[1];
@@ -1335,9 +1562,9 @@ int     Run::dumpECM()  {
     out << endl;
     for (auto node : nodes_) {
         out << left << setw(6) << node->id_;
-        out << " " << right << setw(12) << scientific << setprecision(5) << node->position_[0];
-        out << " " << right << setw(12) << scientific << setprecision(5) << node->position_[1];
-        out << " " << right << setw(12) << scientific << setprecision(5) << node->position_[2];
+        out << " " << right << setw(12) << scientific << setprecision(numeric_limits<double>::max_digits10) << node->position_[0];
+        out << " " << right << setw(12) << scientific << setprecision(numeric_limits<double>::max_digits10) << node->position_[1];
+        out << " " << right << setw(12) << scientific << setprecision(numeric_limits<double>::max_digits10) << node->position_[2];
         out << " " << right << setw(3) << int(node->link_);
         out << endl;
     }

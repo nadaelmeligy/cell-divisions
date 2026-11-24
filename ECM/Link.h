@@ -33,6 +33,9 @@ class Link {
 public:
     Polygon * polygon_;
     Node * node_;
+    // CHANGED 2026-11-24: this linker's own rest length, used with 'link_rest attach' (passive linkers):
+    // its length when it attached. -1 = not set yet (FiberLink::restLength sets it on first use).
+    double restLength_ = -1.;
     explicit Link(Run *, Polygon *, Node *);
 
 private:

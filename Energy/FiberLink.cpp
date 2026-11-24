@@ -47,6 +47,7 @@ FiberLink::FiberLink(Run * run) {
     minEdgeLength_ = 0.02;
     maxEdgeLength_ = 1.5;
     nFormedLinks_ = 0;
+    linkStartTime_ = 500.;  // CHANGED 2026-11: default = the value that used to be typed into Run.cpp
 }
 
 int     FiberLink::updateForces() {
@@ -74,7 +75,8 @@ int     FiberLink::updateForces() {
         dx[2] = node->position_[2] - polygon->center_[2];
         run_->box_->resetDistance(dx);
         double l = sqrt(dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]);
-        double Fabs = ks_ * (-1. + l0_ / l);
+        // CHANGED 2026-11-24: per-linker rest length with 'link_rest attach' (else l0_). Old: ks_ * (-1. + l0_ / l)
+        double Fabs = ks_ * (-1. + restLength(link) / l);
         double FPolygon[3];
         FPolygon[0] = (-1.0) * Fabs * dx[0];
         FPolygon[1] = (-1.0) * Fabs * dx[1];
@@ -114,8 +116,22 @@ int FiberLink::updateEnergy() {
         dx[2] = node->position_[2] - polygon->center_[2];
         run_->box_->resetDistance(dx);
         double l = sqrt(dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]);
-        stretchEnergy_ += 0.5 * ks_ * pow(l - l0_, 2.0);
+        stretchEnergy_ += 0.5 * ks_ * pow(l - restLength(link), 2.0);  // CHANGED 2026-11-24, old: l - l0_
     }
 
     return 0;
+}
+
+// CHANGED 2026-11-24: per-linker rest length for passive linkers (see FiberLink.h)
+double FiberLink::linkLength(Link * link) {
+    double dx[3];
+    for (int m = 0; m < 3; m++) dx[m] = link->node_->position_[m] - link->polygon_->center_[m];
+    run_->box_->resetDistance(dx);
+    return sqrt(dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]);
+}
+
+double FiberLink::restLength(Link * link) {
+    if (!restAtAttach_) return l0_;
+    if (link->restLength_ < 0.) link->restLength_ = linkLength(link);
+    return link->restLength_;
 }

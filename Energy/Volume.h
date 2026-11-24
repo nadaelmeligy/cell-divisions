@@ -39,6 +39,7 @@ public:
 
     int updateForces();
     int updatePolygonDirections();
+    void updateExteriorDirections();
     int updateVolume();
     int updatePressure();
     int updatePolygonForces(Cell *, Polygon *);

@@ -33,6 +33,8 @@ public:
     double  Lth_;   // threshold length of network reconnection
     long int count_IH_;
     long int count_HI_;
+    long int rejectedProposals_ = 0;
+    long int acceptedProposals_ = 0;
     bool verbose_;
 
     explicit Reconnection(Run *);
