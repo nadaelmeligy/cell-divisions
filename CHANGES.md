@@ -115,6 +115,17 @@ Checks (all byte-identical except the wall-clock column of `run.log`):
 runs `runs/tao_*_p1_s7` (built before the Nov 24 audit fixes) is kept in `build-preaudit/`, so those
 runs can still be reproduced bit for bit.
 
+## 9. Several linkers per gel node, for merged-node gels (Nov 24)
+
+| Change | What it does | Why |
+|---|---|---|
+| `--link-node-capacity M` (run_growth.py, default 1) | Under the Python link rules a gel node may hold up to M linkers (linkers.py counts node use instead of keeping a set). | The Matrigel-like mesh merges the 3 crosslink nodes of each lattice site into one; with M = 1 it had a third of the binding slots, so linkers were limited by free nodes (108 vs 404). M = 3 keeps the slots per site. |
+| `Run::loadLinks` accepts a repeated node under `linkrules python` | The engine no longer drops the 2nd and 3rd linker on one node; Python enforces M. Engine linker rules are unchanged. | Bookkeeping only: the forces of several linkers on one node already add (FiberLink.cpp). |
+| `tvm --runtime-features` prints `tvm-runtime-v3` | run_growth.py refuses M > 1 with an older engine. | An older engine would silently drop the extra linkers. |
+
+With M = 1 every run is unchanged (the same linker files are written). Checked: a 5-step mesh run seeds 50 linkers
+at t = 2 with M = 3 (25 with M = 1; the fiber gel seeds 50). Details: experiments/matrigel/README.md, "Reruns".
+
 ## Where things are
 
 - Experiments, each with a README:

@@ -1,0 +1,8 @@
+[a=2.82843] R=3.0 S_shell=-0.417 flat_push=nan P=0.000e+00 0s
+[a=2.82843] R=3.6 S_shell=-0.181 flat_push=nan P=0.000e+00 0s
+[a=2.82843] R=4.2 S_shell=-0.009 flat_push=1.00 P=7.887e-02 0s
+[a=2.82843] R=4.8 S_shell=-0.082 flat_push=1.00 P=2.891e-01 1s
+[a=2.82843] R=5.4 S_shell=-0.146 flat_push=1.00 P=4.907e-01 1s
+[a=2.82843] R=6.0 S_shell=-0.176 flat_push=1.00 P=6.638e-01 1s
+[a=2.82843] R=6.6 S_shell=-0.280 flat_push=1.00 P=9.072e-01 1s
+done /Users/nadaelmeligy/Documents/PhD/Code/3DVM-ECM/experiments/matrigel/results/a2.82843_ks4.5.csv

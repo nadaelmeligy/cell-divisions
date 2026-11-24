@@ -1,0 +1,12 @@
+Before cutting and diluting, number of phantom vertices: 49152
+Before cutting and diluting, number of edges: 98304
+Number of phantom vertices: 48965
+Number of edges: 84145
+graph edges: 84145
+graph linkers: 74037
+graph edges without loops: 83627
+graph linkers without loops: 73001
+fiber edges: 83627
+connectivity: 3.4158
+p: 0.8511
+number of fiber end nodes: 36
