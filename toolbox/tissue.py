@@ -517,7 +517,9 @@ class Sample:
         with open(self.config_dir_+filename, "w") as file:
             file.write(f"vertices {len(self.vertices_):d}\n")
             for _, vertex in self.vertices_.items():
-                file.write(f"{vertex.id_:6d} {vertex.position_[0]:12.5e} {vertex.position_[1]:12.5e} {vertex.position_[2]:12.5e}\n")
+                # CHANGED 2026-11-24: full precision (was 12.5e = 6 digits), so the topology written after a
+                # division keeps the engine's exact positions (needed for exact restarts).
+                file.write(f"{vertex.id_:6d} {vertex.position_[0]:.17g} {vertex.position_[1]:.17g} {vertex.position_[2]:.17g}\n")
             file.write("edges {:d}\n".format(len(self.edges_)))
             for _, edge in self.edges_.items():
                 file.write(f"{edge.id_:d}")

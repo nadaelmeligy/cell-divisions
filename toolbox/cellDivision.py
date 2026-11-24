@@ -221,7 +221,11 @@ class cellDivision:
             del self.sample.polygons_[polygonID]
         for polygonID,polygon in self.sample.polygons_.items():
             rearrangePolygonVerticesFlag = False
-            for edgeID in polygon.edges_:
+            # CHANGED 2026-11: loop over a copy. Removing items from a list while looping over the
+            # same list makes Python skip the next item, so a second cut edge in the same face could
+            # be missed. (Preventive: on our samples no division came out different.)
+            # Old: for edgeID in polygon.edges_:
+            for edgeID in list(polygon.edges_):
                 if edgeID in motherEdgeIDToDaughterEdgeIDs:
                     rearrangePolygonVerticesFlag = True
                     polygon.edges_.remove(edgeID)
@@ -236,7 +240,8 @@ class cellDivision:
         self.sample.cells_.update(newCells)
         del self.sample.cells_[cell.id_]
         for cellID,cell in self.sample.cells_.items():
-            for polygonID in cell.polygons_:
+            # CHANGED 2026-11: loop over a copy, same reason as above. Old: for polygonID in cell.polygons_:
+            for polygonID in list(cell.polygons_):
                 if polygonID in motherPolygonIDToDaughterPolygonIDs:
                     cell.polygons_.remove(polygonID)
                     for daughterPolygonID in motherPolygonIDToDaughterPolygonIDs[polygonID]:

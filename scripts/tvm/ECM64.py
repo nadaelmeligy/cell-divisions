@@ -30,6 +30,44 @@ import math
 import numpy as np
 import networkx as nx
 import sys
+
+# CHANGED 2026-11: three optional command-line flags. Without them the script is unchanged.
+#   --hole-radius R   radius of the hole cut for the organoid (default 5.5, the old typed-in value)
+#   --p P             probability that each lattice bond is kept, i.e. how connected the gel is
+#                     (default 0.80, the old typed-in value; 1 keeps every bond)
+#   --seed S          seed for the random removal of bonds, so the same gel can be made again
+#                     (since 2026-11-19 exactly: the loop-breaking step used to pick from a set
+#                     ordered by memory address, which changed about 0.03% of segments per run).
+#                     With one seed, the gels for different p are nearly nested: the bond removal
+#                     uses one random number per bond, so a bond kept at p = 0.7 is also kept at
+#                     0.8, 0.9 and 1. The later step that cuts closed fiber loops at a random place
+#                     differs between gels, so about 3% of segments differ (checked for seed 7).
+#   --p-left P        bonds whose midpoint has x < 0 are kept with probability P instead (the x > 0
+#                     half keeps --p): a gel that is looser or tighter on one side.
+# The flags are taken out of sys.argv, so "python ECM64.py" and "python ECM64.py docker" work as before.
+HOLE_RADIUS = 5.5
+BOND_PROBABILITY = 0.80
+def _pop_flag(name, cast):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        value = cast(sys.argv[i + 1])
+        del sys.argv[i:i + 2]
+        return value
+    return None
+_r = _pop_flag("--hole-radius", float)
+if _r is not None:
+    HOLE_RADIUS = _r
+_p = _pop_flag("--p", float)
+if _p is not None:
+    BOND_PROBABILITY = _p
+_seed = _pop_flag("--seed", int)
+if _seed is not None:
+    np.random.seed(_seed)
+# CHANGED 2026-11: --p-left P keeps bonds whose midpoint has x < 0 with probability P instead of --p,
+# to make a gel that is looser (or tighter) on one side. With one seed the x < 0 half is then exactly
+# the gel of --p P and the x > 0 half exactly the gel of --p (one random number per bond, fixed order).
+P_LEFT = _pop_flag("--p-left", float)
+
 class Vertex:
     def __init__(self, position, ijk, id):
         if len(position) == 3:
@@ -98,7 +136,8 @@ class Cube:
         self.edges.append(edge)
 
 def main():
-    p = 0.80
+    # CHANGED 2026-11: bond probability from the --p flag (default 0.80). Old: p = 0.80
+    p = BOND_PROBABILITY
     Nx, Ny, Nz = (19, 19, 19) #(16+3)
     l0 = 4.0 #halve this
     lk = 16. #->double this
@@ -132,9 +171,14 @@ def main():
     #         for edge in cube.edges:
     #             edge.on = True
 
+    # CHANGED 2026-11: the hole radius was typed in as 5.5, which fits the 243-cell organoid
+    # (outer corners at about 5). For the 29-cell organoid the gel then starts more than 3 away
+    # from every cell face, and the engine only links a face to fiber points within 3, so no
+    # linker could ever form. Now it is the --hole-radius flag (default 5.5).
+    # Old: if np.sqrt(x*x+y*y+z*z) < 5.5:
     for pVertex in phantomVertices:
         x, y, z = pVertex.position
-        if np.sqrt(x*x+y*y+z*z) < 5.5:
+        if np.sqrt(x*x+y*y+z*z) < HOLE_RADIUS:
             pVertex.on = False
             for i in range(2):
                 for edge in pVertex.edges[i]:
@@ -160,7 +204,23 @@ def main():
     # dilute edges
     for edge in edges:
         if edge.on:
-            if np.random.uniform() < p:
+            # CHANGED 2026-11: with --p-left, bonds with midpoint x < 0 use that probability.
+            # Old: if np.random.uniform() < p:
+            # CHANGED 2026-11-19: the side comes from the minimum-image midpoint, and bonds on the two planes
+            # between the halves (x = 0 and the periodic edge x = +-32) get the mean probability, so that
+            # swapping --p and --p-left gives mirror-image gels. Before, both planes went to the --p half.
+            p_edge = p
+            if P_LEFT is not None:
+                box = lk * l0
+                x0, x1 = edge.vertices[0].position[0], edge.vertices[1].position[0]
+                d = x1 - x0
+                d = d - box if d > 0.5 * box else (d + box if d < -0.5 * box else d)
+                m = (x0 + 0.5 * d + 0.5 * box) % box - 0.5 * box
+                if abs(m) < 1e-9 or abs(abs(m) - 0.5 * box) < 1e-9:
+                    p_edge = 0.5 * (p + P_LEFT)
+                elif m < 0:
+                    p_edge = P_LEFT
+            if np.random.uniform() < p_edge:
                 edge.on = True
             else:
                 edge.on = False
@@ -379,7 +439,11 @@ def fibersClassification(phantomVertices, edges):
                 if edge.end:
                     ends.append(edge)
             if len(ends) == 0:
-                list(component)[np.random.randint(len(component))].on = False
+                # CHANGED 2026-11-19: pick from the component sorted by vertex ids, so the same --seed gives the
+                # same gel (a set of Edge objects is ordered by memory address, which changes from run to run).
+                # Old: list(component)[np.random.randint(len(component))].on = False
+                order = sorted(component, key=lambda e: tuple(sorted((e.vertices[0].id, e.vertices[1].id))))
+                order[np.random.randint(len(order))].on = False
     G = nx.Graph()
     for edge in edges:
         if edge.on:
